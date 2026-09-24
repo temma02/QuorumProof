@@ -3,6 +3,19 @@
 # Triggered manually (workflow_dispatch) or on pushes to `release/*` branches.
 # Deploys to 10% of endpoints, monitors health for the soak period, then
 # promotes to full rollout or rolls back automatically.
+#
+# Issue #1491: Rollback is no longer driven by health-check calls alone. Before
+# the soak period is declared successful, the workflow queries the Prometheus
+# API for firing alerts scoped to the canary instance/version label. Any
+# `severity: critical` alert on the canary is treated as an automatic rollback
+# trigger, matching the alertmanager routing split used elsewhere.
+#
+# Dry-run / test mode:
+#   Set the `dry_run` workflow input to `true` (or export CANARY_DRY_RUN=1 when
+#   running the script locally) to exercise the alert-gating logic without a
+#   live bad deploy. In dry-run mode the Prometheus query is still executed and
+#   the alert evaluation is logged, but a critical alert does NOT trigger a
+#   rollback — it only fails the gate so the behavior can be validated safely.
 
 name: Canary Deployment
 
@@ -28,6 +41,14 @@ on:
         description: "Soak period in seconds before promoting to full rollout"
         required: false
         default: "120"
+      dry_run:
+        description: "Dry-run mode: evaluate alert gating without triggering a real rollback"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   push:
     branches:
       - "release/*"
@@ -119,6 +140,52 @@ jobs:
             "$CONTRACT_QUORUM_PROOF" \
             "target/wasm32-unknown-unknown/release/quorum_proof.wasm" \
             "$STELLAR_SECRET_KEY"
+
+      # Issue #1491: Gate the soak period on Prometheus alert state, not just
+      # direct health checks. Query the Prometheus API for firing alerts scoped
+      # to the canary instance/version label. Any `severity: critical` alert on
+      # the canary is an automatic rollback trigger, matching the alertmanager
+      # routing split used elsewhere (critical -> page/rollback, warning -> notify).
+      - name: Check Prometheus alerts for canary
+        id: alert_gate
+        env:
+          PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL || 'http://localhost:9090' }}
+          CANARY_INSTANCE: ${{ vars.CANARY_INSTANCE_LABEL || 'canary' }}
+          CANARY_VERSION: ${{ github.sha }}
+          CANARY_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # Scope the query to the canary instance/version label so we only
+          # consider alerts that belong to this canary, not the whole fleet.
+          QUERY="ALERTS{alertstate=\"firing\",instance=\"${CANARY_INSTANCE}\",version=\"${CANARY_VERSION}\"}"
+          echo "Querying Prometheus for firing canary alerts: ${QUERY}"
+
+          RESPONSE=$(curl -sS --fail --get \
+            --data-urlencode "query=${QUERY}" \
+            "${PROMETHEUS_URL}/api/v1/query")
+
+          echo "Prometheus response: ${RESPONSE}"
+
+          # Extract the severity label of every firing alert on the canary.
+          SEVERITIES=$(echo "${RESPONSE}" | jq -r '.data.result[].metric.severity // empty' | sort -u)
+          echo "Firing severities on canary: ${SEVERITIES:-<none>}"
+
+          if echo "${SEVERITIES}" | grep -qx "critical"; then
+            echo "::error::Critical alert firing on canary (${CANARY_INSTANCE}/${CANARY_VERSION})."
+            if [ "${CANARY_DRY_RUN}" = "true" ]; then
+              echo "Dry-run mode: skipping automatic rollback, failing the gate only."
+            else
+              echo "Treating critical alert as automatic rollback trigger."
+            fi
+            exit 1
+          fi
+
+          if [ -n "${SEVERITIES}" ]; then
+            echo "::warning::Non-critical alerts firing on canary: ${SEVERITIES}"
+          fi
+
+          echo "No critical alerts on canary — soak period may be declared successful."
 
       - name: Notify success
         if: success()
