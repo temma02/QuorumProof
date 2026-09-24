@@ -99,6 +99,8 @@ stellar keys generate deployer --network testnet
 
 Follow the step-by-step guide in `demo/demo-script.md`
 
+> 📜 For an index of all operational scripts (build, deploy, backup/DR, migration, benchmarking) and how they are invoked, see [`scripts/README.md`](scripts/README.md).
+
 ## 📖 Documentation
 
 - [Architecture Overview](docs/architecture.md)
