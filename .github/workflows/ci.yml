@@ -90,6 +90,18 @@ jobs:
       - name: Cargo audit
         run: cargo audit
 
+      # ── cargo-deny advisory policy gate ──────────────────────────────────
+      # deny.toml sets vulnerability = "deny" and unlicensed = "deny", so
+      # `cargo deny check` fails the build on either. The remaining advisory
+      # classes (unmaintained/unsound/yanked/notice) are intentionally left at
+      # "warn" — see deny.toml for the documented reasoning. This step verifies
+      # the policy file is actually enforced in CI, not just declared.
+      - name: Install cargo-deny
+        run: cargo install cargo-deny --locked
+
+      - name: Cargo deny check
+        run: cargo deny check
+
       - name: TruffleHog scan
         uses: trufflesecurity/trufflehog@main
         with:

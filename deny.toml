@@ -2,9 +2,14 @@
 db-path = "$CARGO_HOME/advisory-db"
 db-urls = ["https://github.com/rustsec/advisory-db/raw/main/db.json.gz"]
 vulnerability = "deny"
+# `unsound` and `yanked` are promoted to "deny": both are stronger practical
+# risk signals than `notice` and should fail CI rather than merely warn.
+unsound = "deny"
+yanked = "deny"
+# `unmaintained` stays at "warn": unmaintained crates are not necessarily
+# exploitable, and denying them would block builds on transitive deps we do
+# not control. `notice` stays at "warn" as it is informational only.
 unmaintained = "warn"
-unsound = "warn"
-yanked = "warn"
 notice = "warn"
 
 [licenses]
@@ -36,3 +41,10 @@ unknown-registry = "warn"
 unknown-git = "warn"
 allow-registry = ["https://github.com/rust-lang/crates.io-index"]
 allow-git = []
+
+[advisories.allow]
+# Tracking issue: https://github.com/rustsec/advisory-db/issues/1490
+# Advisory: RUSTSEC-2026-0258 (h2 0.3.27)
+# Revisit by: 2026-09-01 (expires 90 days after the pin was added)
+# scripts/check_deps.sh warns when this exception has been present >90 days.
+RUSTSEC-2026-0258 = "h2 0.3.27: no fixed release available yet; revisit once upstream ships a patch"
