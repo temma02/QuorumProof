@@ -3,6 +3,21 @@
 # Triggered manually (workflow_dispatch) or on pushes to `release/*` branches.
 # Deploys to 10% of endpoints, monitors health for the soak period, then
 # promotes to full rollout or rolls back automatically.
+#
+# Issue #1491: Rollback is no longer driven by health-check calls alone. Before
+# the soak period is declared successful, the workflow queries the Prometheus
+# API for firing alerts scoped to the canary instance/version label. Any
+# `severity: critical` alert on the canary is an automatic rollback trigger,
+# matching the alertmanager routing split (critical vs warning) used elsewhere.
+#
+# Dry-run / test mode:
+#   Set the `dry_run` workflow_dispatch input to `true` (or export
+#   CANARY_DRY_RUN=true) to exercise the alert-gating logic without a live bad
+#   deploy. In dry-run mode the Prometheus query is still executed and the
+#   critical/warning split is evaluated and logged, but a critical alert does
+#   not abort the job — it only reports what *would* have triggered a rollback.
+#   This lets the gating logic be validated against real (or stubbed) alert
+#   data before it is trusted to roll back a production canary.
 
 name: Canary Deployment
 
@@ -28,6 +43,14 @@ on:
         description: "Soak period in seconds before promoting to full rollout"
         required: false
         default: "120"
+      dry_run:
+        description: "Dry-run: evaluate alert gating without triggering a real rollback"
+        required: false
+        default: "false"
+        type: choice
+        options:
+          - "false"
+          - "true"
   push:
     branches:
       - "release/*"
@@ -119,6 +142,60 @@ jobs:
             "$CONTRACT_QUORUM_PROOF" \
             "target/wasm32-unknown-unknown/release/quorum_proof.wasm" \
             "$STELLAR_SECRET_KEY"
+
+      - name: Gate soak on Prometheus alerts (canary-scoped)
+        id: alert_gate
+        env:
+          PROMETHEUS_URL: ${{ vars.PROMETHEUS_URL || 'http://localhost:9090' }}
+          CANARY_INSTANCE: ${{ vars.CANARY_INSTANCE || 'canary' }}
+          CANARY_VERSION: ${{ github.sha }}
+          CANARY_DRY_RUN: ${{ github.event.inputs.dry_run || 'false' }}
+        run: |
+          set -euo pipefail
+
+          # Query the Prometheus API for firing alerts scoped to the canary
+          # instance/version label. This decouples rollback from the canary's
+          # own health-check calls: the alert rules (HighErrorRate,
+          # ContractErrorBurst, HighP95Latency, QuerySLABreach) already encode
+          # what "unhealthy" means for this system.
+          QUERY="ALERTS{alertstate=\"firing\",instance=~\"${CANARY_INSTANCE}.*\",version=\"${CANARY_VERSION}\"}"
+          echo "Querying Prometheus for canary alerts: ${QUERY}"
+
+          RESPONSE=$(curl -sS --fail --get \
+            --data-urlencode "query=${QUERY}" \
+            "${PROMETHEUS_URL}/api/v1/query")
+
+          echo "Prometheus response: ${RESPONSE}"
+
+          # Extract firing alerts and split by severity, matching the
+          # alertmanager routing split (critical vs warning).
+          CRITICAL=$(echo "${RESPONSE}" | jq -r '
+            [.data.result[]
+              | select(.metric.severity == "critical")
+              | .metric.alertname] | unique | join(",")')
+          WARNING=$(echo "${RESPONSE}" | jq -r '
+            [.data.result[]
+              | select(.metric.severity == "warning")
+              | .metric.alertname] | unique | join(",")')
+
+          if [ -n "${WARNING}" ]; then
+            echo "::warning::Canary is tripping warning-severity alerts: ${WARNING}"
+          fi
+
+          if [ -n "${CRITICAL}" ]; then
+            echo "::error::Canary is tripping critical-severity alerts: ${CRITICAL}"
+            if [ "${CANARY_DRY_RUN}" = "true" ]; then
+              echo "::notice::Dry-run enabled — a critical alert WOULD have triggered a rollback, but the job continues."
+              echo "rollback_triggered=false" >> "$GITHUB_OUTPUT"
+            else
+              echo "rollback_triggered=true" >> "$GITHUB_OUTPUT"
+              echo "Critical alert on canary — triggering automatic rollback."
+              exit 1
+            fi
+          else
+            echo "No critical alerts on canary — soak period successful."
+            echo "rollback_triggered=false" >> "$GITHUB_OUTPUT"
+          fi
 
       - name: Notify success
         if: success()
